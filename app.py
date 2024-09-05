@@ -6,6 +6,7 @@ import argparse
 import itertools
 from collections import Counter
 from collections import deque
+import math
 
 import cv2 as cv
 import numpy as np
@@ -19,7 +20,7 @@ from model import PointHistoryClassifier
 def get_args():
     parser = argparse.ArgumentParser()
 
-    parser.add_argument("--device", type=int, default=0)
+    parser.add_argument("--device", type=int, default=1)
     parser.add_argument("--width", help='cap width', type=int, default=960)
     parser.add_argument("--height", help='cap height', type=int, default=540)
 
@@ -37,6 +38,7 @@ def get_args():
 
     return args
 
+bezier_image = None
 
 def main():
     # 引数解析 #################################################################
@@ -45,6 +47,8 @@ def main():
     cap_device = args.device
     cap_width = args.width
     cap_height = args.height
+
+    bezier_image = np.zeros((cap_height,cap_width, 3), np.uint8)
 
     use_static_image_mode = args.use_static_image_mode
     min_detection_confidence = args.min_detection_confidence
@@ -61,7 +65,7 @@ def main():
     mp_hands = mp.solutions.hands
     hands = mp_hands.Hands(
         static_image_mode=use_static_image_mode,
-        max_num_hands=1,
+        max_num_hands=2,
         min_detection_confidence=min_detection_confidence,
         min_tracking_confidence=min_tracking_confidence,
     )
@@ -161,6 +165,7 @@ def main():
                 # 描画
                 debug_image = draw_bounding_rect(use_brect, debug_image, brect)
                 debug_image = draw_landmarks(debug_image, landmark_list)
+
                 debug_image = draw_info_text(
                     debug_image,
                     brect,
@@ -168,11 +173,26 @@ def main():
                     keypoint_classifier_labels[hand_sign_id],
                     point_history_classifier_labels[most_common_fg_id[0][0]],
                 )
+
+                get_bezier_ctrl_points(
+                    debug_image,
+                    brect,
+                    handedness,
+                    keypoint_classifier_labels[hand_sign_id],
+                    point_history_classifier_labels[most_common_fg_id[0][0]],
+                )
+
         else:
             point_history.append([0, 0])
 
         debug_image = draw_point_history(debug_image, point_history)
         debug_image = draw_info(debug_image, fps, mode, number)
+
+        for point in bezier_ctrl_points:
+            cv.circle(debug_image, point, 10, (0,255,0), -1)
+
+        if (bezier_ctrl_points) == 4:
+            debug_image = draw_bezier_line(debug_image, bezier_ctrl_points)
 
         # 画面反映 #############################################################
         cv.imshow('Hand Gesture Recognition', debug_image)
@@ -491,52 +511,82 @@ def draw_bounding_rect(use_brect, image, brect):
 
     return image
 
+bezier_ctrl_points = []
+open_hand = True
 
-def draw_info_text(image, brect, handedness, hand_sign_text,
-                   finger_gesture_text):
-    cv.rectangle(image, (brect[0], brect[1]), (brect[2], brect[1] - 22),
-                 (0, 0, 0), -1)
+def binomial_coeffs(n):
+    coeffs = []
+    for k in range(n + 1):
+        coeff = math.comb(n, k)
+        coeffs.append(coeff)
+    return coeffs
 
+def compute_bezier_point(t, ctrl_points, coeffs):
+    n = len(ctrl_points) - 1
+    bezier_point = np.array([0.0, 0.0])
+    for i in range(len(ctrl_points)):
+        bernstein_poly = coeffs[i] * ((1 - t) ** (n - i)) * (t ** i)
+        bezier_point += bernstein_poly * np.array(ctrl_points[i])
+    return bezier_point
+
+def draw_bezier_curve(debug_image, ctrl_points):
+    n_ctrl_points = len(ctrl_points)
+    coeffs = binomial_coeffs(n_ctrl_points - 1)
+    resolution = 1000
+    for k in range(resolution + 1):
+        t = k / resolution
+        bezier_point = compute_bezier_point(t, ctrl_points, coeffs)
+        x, y = int(bezier_point[0]), int(bezier_point[1])
+        if 0 <= x < debug_image.shape[1] and 0 <= y < debug_image.shape[0]:
+            cv.circle(debug_image, (x, y), 2, (255, 0, 0), -1)
+    return debug_image
+
+def get_bezier_ctrl_points(image, brect, handedness, hand_sign_text, finger_gesture_text):
+    global open_hand, bezier_ctrl_points
+    x_m_point = (brect[0] + brect[2]) / 2
+    y_m_point = (brect[1] + brect[3]) / 2
+    mid_point = (int(x_m_point), int(y_m_point))
+    if "Open" in hand_sign_text:
+        open_hand = True
+    if "Close" in hand_sign_text:
+        if open_hand:
+            if len(bezier_ctrl_points) < 4:
+                for point in bezier_ctrl_points:
+                    dist = euclidian_distance(mid_point, point)
+                    if dist <= 50:
+                        return
+                bezier_ctrl_points.append(mid_point)
+            open_hand = False
+    print(bezier_ctrl_points)
+
+def euclidian_distance(p, q):
+    return math.sqrt(math.pow((p[0] - q[0]), 2) + math.pow((p[1] - q[1]), 2))
+
+def draw_info_text(image, brect, handedness, hand_sign_text, finger_gesture_text):
+    cv.rectangle(image, (brect[0], brect[1]), (brect[2], brect[1] - 22), (0, 0, 0), -1)
     info_text = handedness.classification[0].label[0:]
     if hand_sign_text != "":
         info_text = info_text + ':' + hand_sign_text
-    cv.putText(image, info_text, (brect[0] + 5, brect[1] - 4),
-               cv.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 1, cv.LINE_AA)
-
+    cv.putText(image, info_text, (brect[0] + 5, brect[1] - 4), cv.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 1, cv.LINE_AA)
     if finger_gesture_text != "":
-        cv.putText(image, "Finger Gesture:" + finger_gesture_text, (10, 60),
-                   cv.FONT_HERSHEY_SIMPLEX, 1.0, (0, 0, 0), 4, cv.LINE_AA)
-        cv.putText(image, "Finger Gesture:" + finger_gesture_text, (10, 60),
-                   cv.FONT_HERSHEY_SIMPLEX, 1.0, (255, 255, 255), 2,
-                   cv.LINE_AA)
-
+        cv.putText(image, "Finger Gesture:" + finger_gesture_text, (10, 60), cv.FONT_HERSHEY_SIMPLEX, 1.0, (0, 0, 0), 4, cv.LINE_AA)
+        cv.putText(image, "Finger Gesture:" + finger_gesture_text, (10, 60), cv.FONT_HERSHEY_SIMPLEX, 1.0, (255, 255, 255), 2, cv.LINE_AA)
     return image
-
 
 def draw_point_history(image, point_history):
     for index, point in enumerate(point_history):
         if point[0] != 0 and point[1] != 0:
-            cv.circle(image, (point[0], point[1]), 1 + int(index / 2),
-                      (152, 251, 152), 2)
-
+            cv.circle(image, (point[0], point[1]), 1 + int(index / 2), (152, 251, 152), 2)
     return image
 
-
 def draw_info(image, fps, mode, number):
-    cv.putText(image, "FPS:" + str(fps), (10, 30), cv.FONT_HERSHEY_SIMPLEX,
-               1.0, (0, 0, 0), 4, cv.LINE_AA)
-    cv.putText(image, "FPS:" + str(fps), (10, 30), cv.FONT_HERSHEY_SIMPLEX,
-               1.0, (255, 255, 255), 2, cv.LINE_AA)
-
+    cv.putText(image, "FPS:" + str(fps), (10, 30), cv.FONT_HERSHEY_SIMPLEX, 1.0, (0, 0, 0), 4, cv.LINE_AA)
+    cv.putText(image, "FPS:" + str(fps), (10, 30), cv.FONT_HERSHEY_SIMPLEX, 1.0, (255, 255, 255), 2, cv.LINE_AA)
     mode_string = ['Logging Key Point', 'Logging Point History']
     if 1 <= mode <= 2:
-        cv.putText(image, "MODE:" + mode_string[mode - 1], (10, 90),
-                   cv.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 1,
-                   cv.LINE_AA)
+        cv.putText(image, "MODE:" + mode_string[mode - 1], (10, 90), cv.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 1, cv.LINE_AA)
         if 0 <= number <= 9:
-            cv.putText(image, "NUM:" + str(number), (10, 110),
-                       cv.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 1,
-                       cv.LINE_AA)
+            cv.putText(image, "NUM:" + str(number), (10, 110), cv.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 1, cv.LINE_AA)
     return image
 
 
